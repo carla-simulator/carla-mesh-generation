@@ -1,0 +1,8 @@
+.vs/
+.vscode/
+Binaries/
+Intermediate/
+Build/
+ThirdParty/
+Content/
+PythonIntermediate/

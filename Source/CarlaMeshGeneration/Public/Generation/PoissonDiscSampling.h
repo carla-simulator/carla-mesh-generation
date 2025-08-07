@@ -18,10 +18,28 @@ UCLASS(BlueprintType, ClassGroup = (Procedural))
 class UPCGPoissonDiscSamplingSettings : public UPCGSettings
 {
   GENERATED_BODY()
+
+public:
+  UPCGPoissonDiscSamplingSettings();
+
+  //~Begin UPCGSettings interface
+#if WITH_EDITOR
+  virtual FName GetDefaultNodeName() const override { return FName(TEXT("Poisson Disc Sampling")); }
+  virtual FText GetDefaultNodeTitle() const override { return NSLOCTEXT("PCGPoissonDiscSampling", "NodeTitle", "Poisson Disc Sampling"); }
+  virtual EPCGSettingsType GetType() const override { return EPCGSettingsType::Spatial; }
+#endif
+
+protected:
+  virtual TArray<FPCGPinProperties> InputPinProperties() const override;
+  virtual TArray<FPCGPinProperties> OutputPinProperties() const override;
+
+  virtual FPCGElementPtr CreateElement() const override;
+  //~End UPCGSettings interface
+
 public:
 
   UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = Settings)
-  FVector2D Extent = FVector2D(100.0F, 100.0F);
+  int32 SplineSampleCount = 10;
 
   UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = Settings)
   float MinDistance = 1.0F;

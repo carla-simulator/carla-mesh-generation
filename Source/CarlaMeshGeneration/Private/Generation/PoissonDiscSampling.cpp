@@ -10,6 +10,10 @@
 
 #include "PCGContext.h"
 #include "PCGComponent.h"
+#include "PCGParamData.h"
+#include "Metadata/PCGMetadata.h"
+#include "Metadata/PCGMetadataAttributeTpl.h" 
+
 #include "PCGCustomVersion.h"
 #include "PCGPin.h"
 #include "Data/PCGPointData.h"
@@ -38,8 +42,9 @@ UPCGPoissonDiscSamplingSettings::UPCGPoissonDiscSamplingSettings()
 TArray<FPCGPinProperties> UPCGPoissonDiscSamplingSettings::InputPinProperties() const
 {
   TArray<FPCGPinProperties> Properties;
-  FPCGPinProperties& InputPinProperty = Properties.Emplace_GetRef(PCGPinConstants::DefaultInputLabel, EPCGDataType::Spline);
-  InputPinProperty.SetRequiredPin();
+  FPCGPinProperties& SplineInputPinProperty = Properties.Emplace_GetRef(PCGPinConstants::DefaultInputLabel, EPCGDataType::Spline);
+  SplineInputPinProperty.SetRequiredPin();
+
   return Properties;
 }
 
@@ -67,43 +72,22 @@ static bool IsInsideSpline(
   std::span<Edge> Edges,
   V2 point)
 {
-  const std::size_t BatchSize = 32;
-  const double Threshold = 1e-4;
+  double TotalAngle = 0.0;
 
-  auto ComputeDelta = [&](Edge e)
+  for (const Edge& e : Edges)
   {
-    auto [v0, v1] = e;
-    V2 u = v0 - point;
-    V2 v = v1 - point;
-    RealT det = KahanDeterminant(u, v);
-    RealT dot = u.Dot(v);
-    return std::atan2(det, dot);
-  };
+    V2 u = e.first - point;
+    V2 v = e.second - point;
 
-  double TotalTheta = 0.0;
-  if (Edges.size() > BatchSize)
-  {
-    std::atomic<double> SharedTheta = 0.0;
-    ParallelFor(Edges.size(), [&](int32 Index)
-    {
-      std::size_t Begin = (std::size_t)Index * BatchSize;
-      std::size_t End = std::min(Begin + BatchSize, Edges.size());
-      double local_theta = 0.0;
-      for (std::size_t i = Begin; i != End; ++i)
-        local_theta += ComputeDelta(Edges[i]);
-      (void)SharedTheta.fetch_add(local_theta, std::memory_order_relaxed);
-    });
-    TotalTheta = SharedTheta.load(std::memory_order_acquire);
-  }
-  else
-  {
-    for (Edge& e : Edges)
-      TotalTheta += ComputeDelta(e);
+    double det = u.X * v.Y - u.Y * v.X;
+    double dot = u.X * v.X + u.Y * v.Y;
+    double angle = std::atan2(det, dot);
+
+    TotalAngle += angle;
   }
 
-  double WindingNumber = std::abs(TotalTheta) / (double)PI;
-
-  return WindingNumber > Threshold;
+  // Winding number check: if abs(total angle) ~ 2*PI, we're inside
+  return FMath::Abs(TotalAngle) > PI;
 }
 
 static FBox ComputeSplineBoundingBox(
@@ -126,181 +110,139 @@ static std::vector<V2> GeneratePoissonDiscPoints(
   FPCGContext* Context,
   FBox SplineBB,
   std::span<Edge> Edges,
+  float MinDistance,
   const UPCGPoissonDiscSamplingSettings& Settings)
 {
   std::random_device RD;
   std::ranlux48 PRNG(RD());
-  std::uniform_real_distribution<RealT> URD((RealT)0, (RealT)1);
+  std::uniform_real_distribution<RealT> URD(0, 1);
 
-  auto Sqrt2 = FMath::Sqrt((RealT)2);
-  auto Pi = (RealT)PI;
-  auto Tau = Pi * 2;
+  const RealT Sqrt2 = FMath::Sqrt((RealT)2);
+  const RealT Tau = (RealT)(2.0 * PI);
 
-  auto Origin = V2(SplineBB.Min.X, SplineBB.Min.Y);
-  auto Extent3D = SplineBB.GetExtent();
-  auto Extent = V2(Extent3D.X, Extent3D.Y);
-  auto R = (RealT)Settings.MinDistance;
-  auto R2 = R * R;
-  auto MaxRetries = Settings.MaxRetries;
-  auto ZeroVec = V2(0, 0);
+  const V2 Min(SplineBB.Min.X, SplineBB.Min.Y);
+  const V2 Max(SplineBB.Max.X, SplineBB.Max.Y);
+  const V2 Extent = Max - Min;
 
-  auto CellSize = R / Sqrt2; // Do not use InvSqrt, we want precision.
-  auto GridFloat = Extent / CellSize;
-  FIntPoint GridSize(FMath::CeilToInt(GridFloat.X), FMath::CeilToInt(GridFloat.Y));
-  auto CellCount = GridSize.X * GridSize.Y;
-  bool UseBitMask = 4096 >= (CellCount / 8);
+  const RealT R = (RealT)MinDistance;
+  const RealT R2 = R * R;
+  const IntT MaxRetries = Settings.MaxRetries;
+
+  const RealT CellSize = R / Sqrt2;
+  const V2 GridFloat = Extent / CellSize;
+  const FIntPoint GridSize(FMath::CeilToInt(GridFloat.X), FMath::CeilToInt(GridFloat.Y));
+  const int32 CellCount = GridSize.X * GridSize.Y;
+  const bool UseBitMask = (4096 >= (CellCount / 8));
 
   std::unordered_map<IntT, V2> Grid;
   std::vector<bool> Occupancy;
   if (UseBitMask)
-    Occupancy = std::vector<bool>(CellCount);
-  
-  auto GetRandomScalar01 = [&]
-  {
-    return URD(PRNG);
-  };
+    Occupancy.resize(CellCount);
 
-  auto GetRandomScalar = [&](RealT Min, RealT Max)
-  {
-      return std::fma(GetRandomScalar01(), Max - Min, Min);
-  };
+  auto GetRandomScalar = [&](RealT MinVal, RealT MaxVal)
+    {
+      return std::fma(URD(PRNG), MaxVal - MinVal, MinVal);
+    };
 
-  auto GetRandomPoint = [&](V2 Min, V2 Max)
-  {
+  auto GetRandomPoint = [&](V2 A, V2 B)
+    {
       return V2(
-        GetRandomScalar(Min.X, Max.X),
-        GetRandomScalar(Min.Y, Max.Y));
-  };
+        GetRandomScalar(A.X, B.X),
+        GetRandomScalar(A.Y, B.Y));
+    };
 
   auto GridCoordToFlatIndex = [&](I2 Key)
-  {
-    return Key.X + Key.Y * GridSize.X;
-  };
+    {
+      return Key.X + Key.Y * GridSize.X;
+    };
 
   auto GridQuery = [&](I2 Key) -> std::optional<V2>
-  {
-      auto Flat = GridCoordToFlatIndex(Key);
-      if (UseBitMask)
-        if (!Occupancy[Flat])
-          return std::nullopt;
+    {
+      const int32 Flat = GridCoordToFlatIndex(Key);
+      if (UseBitMask && !Occupancy[Flat])
+        return std::nullopt;
       auto it = Grid.find(Flat);
-      if (it == Grid.cend())
+      if (it == Grid.end())
         return std::nullopt;
       return it->second;
-  };
+    };
 
   auto GridAdd = [&](I2 Key, V2 Value)
-  {
-      auto Flat = GridCoordToFlatIndex(Key);
+    {
+      const int32 Flat = GridCoordToFlatIndex(Key);
       if (UseBitMask)
         Occupancy[Flat] = true;
-      Grid.insert({ Flat, Value });
-  };
-  
+      Grid[Flat] = Value;
+    };
+
   std::vector<V2> Results2D;
   std::vector<V2> Pending;
   Results2D.reserve(CellCount);
   Pending.reserve(CellCount);
   Grid.reserve(CellCount);
 
-  V2 First = GetRandomPoint(Origin, Extent);
+  V2 First = GetRandomPoint(Min, Max);
   Results2D.push_back(First);
   Pending.push_back(First);
 
-  UE_LOG(
-    LogCarlaMeshGeneration,
-    Log,
+  UE_LOG(LogCarlaMeshGeneration, Log,
     TEXT("Generating Poisson Disc Sampling points array.\n")
-    TEXT(" R = %f.\n")
-    TEXT(" Max Retries = %u.\n")
-    TEXT(" Grid Size = %ix%i.\n")
-    TEXT(" AABB = { Min: (%f, %f), Max: (%f, %f) }.\n")
-    TEXT(" Cell Count = %i.\n")
-    TEXT(" Cell Size = %f.\n"),
-    R, (unsigned)MaxRetries,
-    GridSize.X, GridSize.Y,
-    SplineBB.Min.X, SplineBB.Min.Y, SplineBB.Max.X, SplineBB.Max.Y,
-    CellCount,
-    CellSize
-  );
+    TEXT(" R = %f | MaxRetries = %d | GridSize = (%d, %d) | CellCount = %d\n")
+    TEXT(" AABB Min = (%f, %f), Max = (%f, %f) | CellSize = %f"),
+    R, MaxRetries, GridSize.X, GridSize.Y, CellCount,
+    Min.X, Min.Y, Max.X, Max.Y, CellSize);
 
   while (!Pending.empty())
   {
     std::uniform_int_distribution<IntT> UID(0, (IntT)Pending.size() - 1);
     IntT Index = UID(PRNG);
-    check(Index < (IntT)Pending.size());
     V2 Point = Pending[Index];
     bool Found = false;
-    for (IntT i = 0; i != MaxRetries; ++i)
+
+    for (IntT i = 0; i < MaxRetries; ++i)
     {
-      RealT Theta = GetRandomScalar(0, Tau);
-      RealT Rho = GetRandomScalar(R, R * 2);
+      const RealT Theta = GetRandomScalar(0, Tau);
+      const RealT Rho = GetRandomScalar(R, 2 * R);
       V2 SinCos;
       FMath::SinCos(&SinCos.Y, &SinCos.X, Theta);
       V2 NewPoint = Point + Rho * SinCos;
-      if (
-        NewPoint.X < 0 || NewPoint.X >= Extent.X ||
-        NewPoint.Y < 0 || NewPoint.Y >= Extent.Y)
+
+      if (NewPoint.X < Min.X || NewPoint.X >= Max.X ||
+        NewPoint.Y < Min.Y || NewPoint.Y >= Max.Y)
         continue;
-      V2 Tmp = NewPoint / CellSize;
+
+      V2 Tmp = (NewPoint - Min) / CellSize;
       I2 GridCoord((IntT)Tmp.X, (IntT)Tmp.Y);
-      I2 Begin(
-        std::max(GridCoord.X - 2, 0),
-        std::max(GridCoord.Y - 2, 0));
-      I2 End(
-        std::min(GridCoord.X + 2, GridSize.X),
-        std::min(GridCoord.Y + 2, GridSize.Y));
 
-      const I2 DefaultOffsets[] =
+      const I2 Offsets[] =
       {
-        I2(-2, -2), I2(-1, -2), I2(0, -2), I2(1, -2), I2(2, -2),
-        I2(-1, -2), I2(-1, -1), I2(0, -1), I2(1, -1), I2(2, -1),
-        I2(-0, -2), I2(-1, -0), I2(0, -0), I2(1, -0), I2(2, -0),
-        I2(1, -2), I2(-1, 1), I2(0, 1), I2(1, 1), I2(2, 1),
-        I2(2, -2), I2(-1, 2), I2(0, 2), I2(1, 2), I2(2, 2)
+        I2(-2,-2), I2(-1,-2), I2(0,-2), I2(1,-2), I2(2,-2),
+        I2(-2,-1), I2(-1,-1), I2(0,-1), I2(1,-1), I2(2,-1),
+        I2(-2, 0), I2(-1, 0), I2(0, 0), I2(1, 0), I2(2, 0),
+        I2(-2, 1), I2(-1, 1), I2(0, 1), I2(1, 1), I2(2, 1),
+        I2(-2, 2), I2(-1, 2), I2(0, 2), I2(1, 2), I2(2, 2)
       };
+
       std::vector<I2> TestPositions;
-      TestPositions.reserve(sizeof(DefaultOffsets) / sizeof(DefaultOffsets[0]));
-      for (I2 Offset : DefaultOffsets)
+      TestPositions.reserve(25);
+      for (I2 Offset : Offsets)
       {
-        I2 TestPoint = GridCoord + Offset;
-        if (
-          TestPoint.X < 0 || TestPoint.Y < 0 ||
-          TestPoint.X >= GridSize.X || TestPoint.Y >= GridSize.Y)
-          continue;
-        TestPositions.push_back(TestPoint);
+        I2 Test = GridCoord + Offset;
+        if (Test.X >= 0 && Test.Y >= 0 && Test.X < GridSize.X && Test.Y < GridSize.Y)
+          TestPositions.push_back(Test);
       }
-
-      auto TestNeighbor = [&](I2 TestPosition)
-      {
-        auto NeighborOpt = GridQuery(TestPosition);
-        if (!NeighborOpt.has_value())
-          return true;
-        V2 Neighbor = NeighborOpt.value();
-        return V2::DistSquared(NewPoint, Neighbor) >= R2;
-      };
 
       bool OK = true;
-      if (TestPositions.size() >= 16)
+      for (I2 Test : TestPositions)
       {
-        std::atomic_bool SharedOK = true;
-        ParallelFor(TestPositions.size(), [&](int32 Index)
-          {
-            if (SharedOK.load(std::memory_order_acquire))
-              if (!TestNeighbor(TestPositions[Index]))
-                SharedOK.store(false, std::memory_order_release);
-          });
-        OK = SharedOK.load(std::memory_order_acquire);
-      }
-      else
-      {
-        for (I2 TestPosition : TestPositions)
+        auto Neighbor = GridQuery(Test);
+        if (Neighbor && V2::DistSquared(NewPoint, *Neighbor) < R2)
         {
-          OK = TestNeighbor(TestPosition);
-          if (!OK)
-            break;
+          OK = false;
+          break;
         }
       }
+
       if (OK)
       {
         Results2D.push_back(NewPoint);
@@ -310,9 +252,14 @@ static std::vector<V2> GeneratePoissonDiscPoints(
         break;
       }
     }
+
     if (!Found)
       Pending.erase(Pending.begin() + Index);
   }
+
+  UE_LOG(LogCarlaMeshGeneration, Log,
+    TEXT("Poisson Disc Sampling generated %d valid points."),
+    Results2D.size());
 
   return Results2D;
 }
@@ -327,12 +274,12 @@ bool FPCGPoissonDiscSampling::ExecuteInternal(
       return P;
   };
 
-  auto SettingsPtr = Context->GetInputSettings<UPCGPoissonDiscSamplingSettings>();
+  const UPCGPoissonDiscSamplingSettings* SettingsPtr = Context->GetInputSettings<UPCGPoissonDiscSamplingSettings>();
   check(SettingsPtr);
-  auto& Settings = *SettingsPtr;
 
   auto Inputs = Context->InputData.GetInputsByPin(PCGPinConstants::DefaultInputLabel);
   auto Output = FPCGContext::NewObject_AnyThread<UPCGPointData>(Context);
+  float MinDistance = SettingsPtr->MinDistance;
 
   for (FPCGTaggedData& Input : Inputs)
   {
@@ -340,31 +287,39 @@ bool FPCGPoissonDiscSampling::ExecuteInternal(
     check(InputData != nullptr);
 
     auto LocalToWorld = InputData->GetTransform();
-    int32 SplineSampleCount = Settings.SplineSampleCount;
-    
+    int32 SplineSampleCount = SettingsPtr->SplineSampleCount;
     std::vector<V2> Results2D;
+    FBox SplineBoundingBox = InputData->GetBounds();
+    std::vector<V2> SplinePoints;
+    
+    SplinePoints.reserve(SplineSampleCount);
+    for (int32 i = 0; i < SplineSampleCount; ++i)
     {
-      std::vector<Edge> SplineEdges(SplineSampleCount);
-      std::vector<V2> SplinePoints;
-      SplinePoints.reserve(SplineSampleCount);
-      for (int32 i = 0; i != SplineSampleCount; ++i)
-      {
-        float Alpha = (float)i / (float)SplineSampleCount;
-        FVector P = InputData->GetLocationAtAlpha(Alpha);
-        P = LocalToWorld.TransformPosition(P);
-        SplinePoints.push_back(V2(P.X, P.Y));
-      }
-      for (std::size_t i = 0; i != SplinePoints.size(); ++i)
-      {
-        std::size_t Next = i + 1;
-        Next = Next < SplinePoints.size() ? Next : 0;
-        SplineEdges[i] = std::make_pair(SplinePoints[i], SplinePoints[Next]);
-      }
-      FBox SplineBoundingBox = ComputeSplineBoundingBox(SplinePoints);
-      Results2D = GeneratePoissonDiscPoints(
-        Context, SplineBoundingBox, SplineEdges, Settings);
+      float Alpha = (float)i / (float)SplineSampleCount;
+      FVector Pos = InputData->GetLocationAtAlpha(Alpha);
+      Pos = InputData->GetTransform().TransformPosition(Pos);
+      SplinePoints.push_back(V2(Pos.X, Pos.Y));
     }
 
+    // Build edges
+    bool bIsClosed = InputData->IsClosed();
+    std::vector<Edge> SplineEdges;
+    SplineEdges.reserve(SplinePoints.size());
+    size_t Count = SplinePoints.size();
+    for (size_t i = 0; i + 1 < Count; ++i)
+      SplineEdges.emplace_back(SplinePoints[i], SplinePoints[i + 1]);
+    if (bIsClosed && Count > 2)
+      SplineEdges.emplace_back(SplinePoints.back(), SplinePoints.front());
+    if (bIsClosed)
+      SplineEdges.emplace_back(SplinePoints.back(), SplinePoints[0]);
+
+    Results2D = GeneratePoissonDiscPoints(
+      Context, SplineBoundingBox, SplineEdges, MinDistance, *SettingsPtr);
+
+    Results2D.erase(std::remove_if(Results2D.begin(), Results2D.end(),
+      [&](const V2& Point) { return !IsInsideSpline(SplineEdges, Point); }),
+      Results2D.end());
+    
     Output->InitializeFromData(InputData);
     auto& OutputPoints = Output->GetMutablePoints();
     OutputPoints.Reserve(Results2D.size());
@@ -372,6 +327,7 @@ bool FPCGPoissonDiscSampling::ExecuteInternal(
       OutputPoints.Add(MakePCGPoint(Point2D));
     Context->OutputData.TaggedData.Add_GetRef(Input).Data = Output;
   }
+
 
   return true;
 }

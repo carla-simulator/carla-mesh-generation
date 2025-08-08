@@ -41,11 +41,14 @@ public:
   UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = Settings)
   int32 SplineSampleCount = 10;
 
-  UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = Settings)
+  UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = Settings, meta = (PCG_Overridable))
   float MinDistance = 1.0F;
 
   UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = Settings)
   int32 MaxRetries = 32;
+
+  UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = Settings)
+  bool bFilterInsideSpline = true;
 
 };
 

@@ -1,6 +1,9 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "CarlaMeshGeneration.h"
+#include "Modules/ModuleManager.h"
+#include "Generation/PoissonDiscSampling.h"
+
 
 #define LOCTEXT_NAMESPACE "FCarlaMeshGenerationModule"
 

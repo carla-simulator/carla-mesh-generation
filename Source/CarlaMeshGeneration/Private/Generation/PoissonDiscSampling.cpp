@@ -278,54 +278,70 @@ bool FPCGPoissonDiscSampling::ExecuteInternal(
   check(SettingsPtr);
 
   auto Inputs = Context->InputData.GetInputsByPin(PCGPinConstants::DefaultInputLabel);
-  auto Output = FPCGContext::NewObject_AnyThread<UPCGPointData>(Context);
   float MinDistance = SettingsPtr->MinDistance;
 
   for (FPCGTaggedData& Input : Inputs)
   {
     const UPCGSplineData* InputData = Cast<UPCGSplineData>(Input.Data);
-    check(InputData != nullptr);
-
-    auto LocalToWorld = InputData->GetTransform();
-    int32 SplineSampleCount = SettingsPtr->SplineSampleCount;
-    std::vector<V2> Results2D;
-    FBox SplineBoundingBox = InputData->GetBounds();
-    std::vector<V2> SplinePoints;
-    
-    SplinePoints.reserve(SplineSampleCount);
-    for (int32 i = 0; i < SplineSampleCount; ++i)
+    if (!InputData)
     {
-      float Alpha = (float)i / (float)SplineSampleCount;
-      FVector Pos = InputData->GetLocationAtAlpha(Alpha);
-      Pos = InputData->GetTransform().TransformPosition(Pos);
-      SplinePoints.push_back(V2(Pos.X, Pos.Y));
+        UE_LOG(LogTemp, Warning, TEXT("Invalid spline input."));
+        continue;
     }
 
-    // Build edges
-    bool bIsClosed = InputData->IsClosed();
+    // Transform bounding box to world space
+    FTransform SplineTransform = InputData->GetTransform();
+    // Sample points along the spline
+    int32 SampleCount = SettingsPtr->SplineSampleCount;
+    std::vector<V2> SplinePoints;
+    SplinePoints.reserve(SampleCount);
+    FBox SplineBoundingBox(EForceInit::ForceInit);
+
+    for (int32 i = 0; i < SampleCount; ++i)
+    {
+        float Alpha = static_cast<float>(i) / SampleCount;
+        FVector LocalPos = InputData->GetLocationAtAlpha(Alpha);
+
+        // Store 2D local coordinates
+        SplinePoints.emplace_back(LocalPos.X, LocalPos.Y);
+
+        // Accumulate bounding box in local space
+        SplineBoundingBox += FVector(LocalPos.X, LocalPos.Y, 0.0f);
+    }
+
+    // Build polygon edges
     std::vector<Edge> SplineEdges;
-    SplineEdges.reserve(SplinePoints.size());
-    size_t Count = SplinePoints.size();
-    for (size_t i = 0; i + 1 < Count; ++i)
-      SplineEdges.emplace_back(SplinePoints[i], SplinePoints[i + 1]);
-    if (bIsClosed && Count > 2)
-      SplineEdges.emplace_back(SplinePoints.back(), SplinePoints.front());
-    if (bIsClosed)
-      SplineEdges.emplace_back(SplinePoints.back(), SplinePoints[0]);
+    for (size_t i = 0; i + 1 < SplinePoints.size(); ++i)
+        SplineEdges.emplace_back(SplinePoints[i], SplinePoints[i + 1]);
+    if (InputData->IsClosed() && SplinePoints.size() > 2)
+        SplineEdges.emplace_back(SplinePoints.back(), SplinePoints.front());
 
-    Results2D = GeneratePoissonDiscPoints(
-      Context, SplineBoundingBox, SplineEdges, MinDistance, *SettingsPtr);
+    // Generate Poisson points
+    std::vector<V2> Results2D = GeneratePoissonDiscPoints(
+        Context, SplineBoundingBox, SplineEdges, SettingsPtr->MinDistance, *SettingsPtr);
 
+    // Filter inside spline
     Results2D.erase(std::remove_if(Results2D.begin(), Results2D.end(),
-      [&](const V2& Point) { return !IsInsideSpline(SplineEdges, Point); }),
-      Results2D.end());
-    
+        [&](const V2& Point) { return !IsInsideSpline(SplineEdges, Point); }),
+        Results2D.end());
+
+    // Build output data
+    UPCGPointData* Output = FPCGContext::NewObject_AnyThread<UPCGPointData>(Context);
     Output->InitializeFromData(InputData);
     auto& OutputPoints = Output->GetMutablePoints();
     OutputPoints.Reserve(Results2D.size());
-    for (auto& Point2D : Results2D)
-      OutputPoints.Add(MakePCGPoint(Point2D));
-    Context->OutputData.TaggedData.Add_GetRef(Input).Data = Output;
+
+    for (const V2& P : Results2D)
+    {
+        FPCGPoint Point;
+        Point.Transform.SetLocation(FVector(P.X, P.Y, 0.0f)); // You can later replace Z
+        OutputPoints.Add(Point);
+    }
+
+    // Add to output tagged data (per spline)
+    FPCGTaggedData& TaggedOutput = Context->OutputData.TaggedData.Emplace_GetRef();
+    TaggedOutput.Pin = PCGPinConstants::DefaultOutputLabel;  // Safe default
+    TaggedOutput.Data = Output;
   }
 
 

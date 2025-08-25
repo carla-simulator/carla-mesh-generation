@@ -4,7 +4,7 @@
 // This work is licensed under the terms of the MIT license.
 // For a copy, see <https://opensource.org/licenses/MIT>.
 
-#include "BlueprintLibrary/PoissonDiscSampling.h"
+#include "Generation/PoissonDiscSampling.h"
 
 #include "PCGContext.h"
 #include "PCGComponent.h"

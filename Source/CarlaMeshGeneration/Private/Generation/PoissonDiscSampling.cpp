@@ -1,10 +1,10 @@
-// Copyright (c) 2025 Computer Vision Center (CVC) at the Universitat Autonoma
+// Copyright (c) 2023 Computer Vision Center (CVC) at the Universitat Autonoma
 // de Barcelona (UAB).
 //
 // This work is licensed under the terms of the MIT license.
 // For a copy, see <https://opensource.org/licenses/MIT>.
-
 #include "Generation/PoissonDiscSampling.h"
+
 
 #include "PCGContext.h"
 #include "PCGComponent.h"
@@ -335,14 +335,7 @@ bool FPCGPoissonDiscSampling::ExecuteInternal(
     auto& OutputPoints = Output->GetMutablePoints();
     OutputPoints.Reserve(Results2D.size());
 
-    // Ensure metadata is initialized
-    UPCGMetadata* Metadata = Output->Metadata;
-    check(Metadata);
-
-    // Create metadata attribute for random float
-    FName AttributeName = TEXT("Density");
-    FPCGMetadataAttribute<float>* RandomAttr = Metadata->CreateAttribute<float>(
-        AttributeName, 0.0f, /* bAllowsInterpolation = */ true, /* bOverrideParent = */ false);
+    
     for (const V2& P : Results2D)
     {
         FVector2D Target2D(P.X, P.Y);
@@ -370,10 +363,8 @@ bool FPCGPoissonDiscSampling::ExecuteInternal(
         FVector WorldPoint = FVector(Target2D.X, Target2D.Y, BestWorldPos.Z);
         Point.Transform.SetLocation(WorldPoint);
 
-        // Add metadata
-        Point.MetadataEntry = Metadata->AddEntry();
-        float RandomValue = FRandomStream(Point.Seed).GetFraction();
-        RandomAttr->SetValue(Point.MetadataEntry, RandomValue);
+        
+      
 
         OutputPoints.Add(Point);
     }
